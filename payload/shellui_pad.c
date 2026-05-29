@@ -44,12 +44,9 @@
 #define GHOSTPAD_ASSIGNMENT_SCREEN_RET ((int32_t)0x803B0006u)
 #define GHOSTPAD_AUTO_DISMISS_ACTIVE   ((int32_t)0x44534D31u) /* "DSM1" */
 #define GHOSTPAD_AUTO_DISMISS_DONE     ((int32_t)0x44534D32u) /* "DSM2" */
-#define GHOSTPAD_ENABLE_PTRACE_UPDATE_FALLBACK 0
+/* PT_IO fallback for shellui_pad_update — always enabled */
 
-/* ============================================================
- * sys_ptrace — elevate credentials for ptrace, then restore
- * (exact pattern from sdk/samples/test_privileges/main.c)
- * ============================================================ */
+/* sys_ptrace — elevate credentials for ptrace, then restore */
 static int
 sys_ptrace(int request, pid_t pid, caddr_t addr, int data)
 {
@@ -74,10 +71,7 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data)
     return ret;
 }
 
-/* ============================================================
- * find_pid — locate a process by thread name via sysctl
- * Offsets from test_privileges (ki_pid@72, ki_tdname@447).
- * ============================================================ */
+/* find_pids — locate processes by thread name via sysctl (ki_pid@72, ki_tdname@447) */
 static size_t
 find_pids(const char *name, pid_t *pids, size_t max_pids)
 {
@@ -129,9 +123,7 @@ find_pids(const char *name, pid_t *pids, size_t max_pids)
     return count;
 }
 
-/* ============================================================
- * resolve_sym — look up a symbol in a remote process library.
- * ============================================================ */
+/* resolve_sym — look up a symbol in a remote process library */
 static intptr_t
 resolve_sym(pid_t pid, uint32_t lib_handle, const char *sym)
 {
@@ -144,9 +136,7 @@ resolve_sym(pid_t pid, uint32_t lib_handle, const char *sym)
     return addr;
 }
 
-/* ============================================================
- * get_lib — wrapper around kernel_dynlib_handle with logging
- * ============================================================ */
+/* get_lib — wrapper around kernel_dynlib_handle with logging */
 static int
 get_lib(pid_t pid, const char *name, uint32_t *handle)
 {
@@ -162,10 +152,7 @@ get_lib(pid_t pid, const char *name, uint32_t *handle)
     return (*handle != 0) ? 0 : -1;
 }
 
-/* ============================================================
- * pt_io_write / pt_io_read — read/write process memory via PT_IO
- * (safe while the process is stopped after PT_ATTACH)
- * ============================================================ */
+/* pt_io_write — write process memory via PT_IO (process must be stopped) */
 static int
 pt_io_write(pid_t pid, intptr_t dst, const void *src, size_t len)
 {
@@ -203,6 +190,15 @@ static ShellUiDirectState g_shellui_direct_state = {0};
 static int32_t g_shellui_direct_last_stage = 0;
 static int64_t g_shellui_direct_last_value = 0;
 
+/* Saved injection state for stub relaunch — populated by shellui_pad_inject */
+static pid_t    g_relaunch_pid            = -1;
+static intptr_t g_relaunch_args_kaddr     = 0;
+static intptr_t g_relaunch_stub_fn        = 0;   /* stub function addr in target */
+static intptr_t g_relaunch_thread_storage = 0;   /* pthread_t storage in target  */
+static intptr_t g_relaunch_pthread_fn     = 0;   /* pthread_create addr in target*/
+static intptr_t g_relaunch_trap_rip       = 0;   /* INT3 addr for pt_call        */
+static intptr_t g_relaunch_malloc_fn      = 0;   /* malloc addr in target — for new stub alloc */
+
 static void
 shellui_pad_direct_set_last_status(int32_t stage, int64_t value)
 {
@@ -229,48 +225,33 @@ shellui_pad_direct_context_usable(pid_t shellui_pid, intptr_t args_kaddr)
            g_shellui_direct_state.args_kaddr == args_kaddr;
 }
 
-#if GHOSTPAD_ENABLE_PTRACE_UPDATE_FALLBACK
+/* Fast single-attempt PT_IO write — no retries, no sleep.
+ * PT_ATTACH stops SceShellCore briefly to write pad_data+seq.
+ * The stub background thread then resumes and calls VDI independently. */
 static int
 shellui_pad_ptrace_update(pid_t shellui_pid, intptr_t args_kaddr,
                           const void *pad_data, uint32_t pad_data_len,
                           uint32_t new_seq)
 {
     intptr_t data_field = args_kaddr + (intptr_t)offsetof(ShellUiPadArgs, pad_data);
-    intptr_t seq_field = args_kaddr + (intptr_t)offsetof(ShellUiPadArgs, seq);
-    int attach_errno = 0;
+    intptr_t seq_field  = args_kaddr + (intptr_t)offsetof(ShellUiPadArgs, seq);
 
-    for (int attempt = 0; attempt < 20; attempt++) {
-        if (sys_ptrace(PT_ATTACH, shellui_pid, 0, 0) == 0) {
-            waitpid(shellui_pid, NULL, 0);
-            if (pt_io_write(shellui_pid, data_field, pad_data, pad_data_len) ||
-                pt_io_write(shellui_pid, seq_field, &new_seq, sizeof(new_seq))) {
-                int write_errno = errno;
-                sys_ptrace(PT_DETACH, shellui_pid, (caddr_t)1, 0);
-                klog_printf("[Ghostpad] shellui_pad_update ptrace write failed errno=%d pid=%d args=0x%lx seq=%u\n",
-                            write_errno, shellui_pid, (unsigned long)args_kaddr,
-                            new_seq);
-                return -1;
-            }
-            sys_ptrace(PT_DETACH, shellui_pid, (caddr_t)1, 0);
-            klog_printf("[Ghostpad] shellui_pad_update ptrace fallback wrote seq=%u pid=%d args=0x%lx\n",
-                        new_seq, shellui_pid, (unsigned long)args_kaddr);
-            return 0;
-        }
-        attach_errno = errno;
-        usleep(50000);
+    if (sys_ptrace(PT_ATTACH, shellui_pid, 0, 0) != 0)
+        return -1;   /* busy — skip this packet, next one will try again */
+
+    waitpid(shellui_pid, NULL, 0);
+
+    if (pt_io_write(shellui_pid, data_field, pad_data, pad_data_len) ||
+        pt_io_write(shellui_pid, seq_field,  &new_seq,  sizeof(new_seq))) {
+        sys_ptrace(PT_DETACH, shellui_pid, (caddr_t)1, 0);
+        return -1;
     }
 
-    klog_printf("[Ghostpad] shellui_pad_update ptrace fallback attach failed errno=%d pid=%d args=0x%lx\n",
-                attach_errno, shellui_pid, (unsigned long)args_kaddr);
-    return -1;
+    sys_ptrace(PT_DETACH, shellui_pid, (caddr_t)1, 0);
+    return 0;
 }
-#endif
 
-/* ============================================================
- * pt_call — call fn(a1..a6) inside a STOPPED process.
- * trap_rip must be the address of an 0xCC byte in pid's space.
- * Returns fn's RAX return value.
- * ============================================================ */
+/* pt_call — call fn(a1..a6) inside a stopped process via INT3; returns RAX */
 static int64_t
 pt_call(pid_t pid, intptr_t fn, intptr_t trap_rip,
         uint64_t a1, uint64_t a2, uint64_t a3,
@@ -908,7 +889,7 @@ void shellui_stub(void *arg)
             }
             last_seq = cur;
         }
-        a->fp_usleep(1000);
+        a->fp_usleep(500);
     }
 
     /* Delete virtual device on clean exit so next run doesn't get 0x803b0001.
@@ -1287,7 +1268,7 @@ void shellui_stub_force_vda(void *arg)
                 }
                 last_seq = cur;
             }
-            a->fp_usleep(1000);
+            a->fp_usleep(500);
         }
     }
 
@@ -1299,20 +1280,8 @@ void shellui_stub_force_vda(void *arg)
 __attribute__((noinline, section(".text.stubvda")))
 void shellui_stub_force_vda_end(void) { }
 
-/* ============================================================
- * shellui_pad_inject — inject a pad stub into an attachable target process.
- *
- * Phase 1 (freeze fix): PT_ATTACH happens FIRST.  Nothing is written to the
- *   target until attach succeeds; if it fails we return -1 immediately with
- *   zero side-effects on the target.
- *
- * Phase 4 (target selection): tries SceShellCore/SceShellUI-side candidates.
- *   The current path uses only SceShellCore/SceShellUI.
- *
- * Phase 5 (clean code cave): uses the library init/fini section directly as
- *   the conservative path. That cave is already proven to boot the recovery
- *   thread reliably on this target.
- * ============================================================ */
+/* shellui_pad_inject — inject a pad stub into an attachable target process.
+ * PT_ATTACH happens first; nothing is written until attach succeeds. */
 int
 shellui_pad_inject(int32_t userId,
                    int      force_virtual_vda,
@@ -1320,17 +1289,7 @@ shellui_pad_inject(int32_t userId,
                    pid_t    *out_shellui_pid,
                    intptr_t *out_args_kaddr)
 {
-    /* Phase 4: candidate processes in priority order. */
-    /* SceShellCore first: it has the confirmed VDA path that creates a virtual
-     * controller. SceShellUI is kept for client-side pad/mbus diagnostics. */
-    /* Priority order: prefer CLIENT-SIDE libScePad processes.
-     * SceShellCore's libScePad is server-side — all client IPC calls fail from
-     * its stub (GetHandle, Open, VDA all return "not found" / IPMI errors).
-     * SceShellUI IS a client: it reads pad state via libScePad IPC for navigation,
-     * so GetHandle/VDA from its stub reach the real pad daemon. */
-    /* force_virtual_vda=1: prefer SceShellCore — its VDA call runs as an
-     * internal (non-IPC) call and has been confirmed to create a device.
-     * Remote-control handles are intentionally not used. */
+    /* Candidate processes: SceShellCore first (server-side VDA), SceShellUI as fallback */
     static const char *const candidates_vda[] = {
         "SceShellCore",
         "SceShellUI",
@@ -1688,6 +1647,17 @@ shellui_pad_inject(int32_t userId,
             klog_printf("[Ghostpad] pthread_create(%s) -> %lld\n",
                         target_name, (long long)pret);
             if (pret == 0) {
+                /* Save relaunch state so post-GBND can restart stub with a known handle */
+                g_relaunch_pid            = target_pid;
+                g_relaunch_args_kaddr     = args_kaddr;
+                g_relaunch_stub_fn        = stub_fn;
+                g_relaunch_thread_storage = thread_storage;
+                g_relaunch_pthread_fn     = fn_pthread_create;
+                g_relaunch_trap_rip       = stub_mem;  /* stub_mem+0 is the INT3 trap */
+                g_relaunch_malloc_fn      = fn_malloc;
+                klog_printf("[Ghostpad] relaunch state saved: stub_fn=0x%lx pthread=0x%lx trap=0x%lx\n",
+                            stub_fn, fn_pthread_create, stub_mem);
+
                 if (pt_pad_handle >= 0 &&
                     ((pt_use_insert && fn_insert) || (!pt_use_insert && fn_vdi))) {
                     g_shellui_direct_state.valid = 1;
@@ -1761,10 +1731,7 @@ shellui_pad_inject(int32_t userId,
     return -1;
 }
 
-/* ============================================================
- * shellui_pad_update — write new pad data (called at 60 Hz).
- * Uses mdbg_copyin — no ptrace attach needed.
- * ============================================================ */
+/* shellui_pad_update — write new pad data at 60 Hz via mdbg_copyin */
 int
 shellui_pad_update(pid_t shellui_pid, intptr_t args_kaddr,
                    const void *pad_data, uint32_t pad_data_len)
@@ -1806,23 +1773,26 @@ shellui_pad_update(pid_t shellui_pid, intptr_t args_kaddr,
 
     uint32_t new_seq = cached_seq + 1;
     intptr_t data_field = args_kaddr + (intptr_t)offsetof(ShellUiPadArgs, pad_data);
+
+    /* Elevate to ptrace authid for mdbg_copyin; restore game authid immediately after */
+    pid_t    _mypid    = getpid();
+    uint64_t _saved_au = kernel_get_ucred_authid(_mypid);
+    if (_saved_au) kernel_set_ucred_authid(_mypid, 0x4800000000010003l);
+
     int copy_ret = mdbg_copyin(shellui_pid, pad_data, data_field, pad_data_len);
+    if (_saved_au) kernel_set_ucred_authid(_mypid, _saved_au);
+
     if (copy_ret) {
         if (!logged_data_copy_failure) {
-            klog_printf("[Ghostpad] shellui_pad_update data copy failed ret=%d errno=%d pid=%d args=0x%lx data=0x%lx len=%u\n",
-                        copy_ret, errno, shellui_pid, (unsigned long)args_kaddr,
-                        (unsigned long)data_field, pad_data_len);
+            klog_printf("[Ghostpad] shellui_pad_update data copy failed ret=%d errno=%d pid=%d\n",
+                        copy_ret, errno, shellui_pid);
             logged_data_copy_failure = 1;
         }
-#if GHOSTPAD_ENABLE_PTRACE_UPDATE_FALLBACK
         if (shellui_pad_ptrace_update(shellui_pid, args_kaddr, pad_data,
                                       pad_data_len, new_seq) == 0) {
             cached_seq = new_seq;
             return 0;
         }
-#else
-        klog_printf("[Ghostpad] shellui_pad_update ptrace fallback disabled after errno=1 attach failures\n");
-#endif
         return -1;
     }
 
@@ -1852,7 +1822,10 @@ shellui_pad_update(pid_t shellui_pid, intptr_t args_kaddr,
     }
 
     intptr_t seq_field = args_kaddr + (intptr_t)offsetof(ShellUiPadArgs, seq);
+    _saved_au = kernel_get_ucred_authid(_mypid);
+    if (_saved_au) kernel_set_ucred_authid(_mypid, 0x4800000000010003l);
     copy_ret = mdbg_copyin(shellui_pid, &new_seq, seq_field, 4);
+    if (_saved_au) kernel_set_ucred_authid(_mypid, _saved_au);
     if (copy_ret) {
         if (!logged_seq_copy_failure) {
             klog_printf("[Ghostpad] shellui_pad_update seq copy failed ret=%d errno=%d pid=%d args=0x%lx seq=0x%lx old=%u new=%u\n",
@@ -1860,15 +1833,11 @@ shellui_pad_update(pid_t shellui_pid, intptr_t args_kaddr,
                         (unsigned long)seq_field, cached_seq, new_seq);
             logged_seq_copy_failure = 1;
         }
-#if GHOSTPAD_ENABLE_PTRACE_UPDATE_FALLBACK
         if (shellui_pad_ptrace_update(shellui_pid, args_kaddr, pad_data,
                                       pad_data_len, new_seq) == 0) {
             cached_seq = new_seq;
             return 0;
         }
-#else
-        klog_printf("[Ghostpad] shellui_pad_update ptrace fallback disabled after errno=1 attach failures\n");
-#endif
         return -1;
     }
 
@@ -2471,25 +2440,9 @@ shellui_pad_dismiss_assignment_screen(int32_t userId, uint64_t virtualDeviceId)
     return (post_handle >= 0) ? 0 : 1;  /* 0=confirmed, 1=VDI sent but assignment unconfirmed */
 }
 
-/* ============================================================
- * shellui_pad_force_bind — bypass the assignment screen entirely.
- *
- * Calls sceMbusBindDeviceWithUserId(virtualDeviceId, userId) via pt_call
- * inside SceShellUI.  This is the same call LoginMgr makes after the user
- * presses Cross; calling it directly skips the VDI/UI step entirely.
- *
- * virtualDeviceId: the 64-bit MBUS device ID from the DEVICE_ADDED klog line
- *   (e.g., 0x25030d).  The Python automation extracts this from klog and
- *   sends it via the GBND packet on the control port.
- * ============================================================ */
-/* ============================================================
- * shellui_pad_test_vdi_cross — send a Cross press to a KNOWN padHandle.
- *
- * padHandle comes from the CIM log (extracted by Python from klog), not from
- * scePadGetHandle (which returns 0x80920008 for virtual devices).
- * The VDI call is safe from a stopped-context (shared memory write, no IPC).
- * Returns 0 if VDI returned 0 on the first frame (indicating success).
- * ============================================================ */
+/* shellui_pad_force_bind — call sceMbusBindDeviceWithUserId in SceShellUI via pt_call */
+
+/* shellui_pad_test_vdi_cross — send a Cross press to a known padHandle via VDI */
 static int
 pad_test_vdi_cross_in_process(const char *process_name, const char *tag, int32_t pad_handle)
 {
@@ -2573,15 +2526,48 @@ shellcore_pad_test_vdi_cross(int32_t pad_handle)
     return pad_test_vdi_cross_in_process("SceShellCore", "vdi_cross_core", pad_handle);
 }
 
-/* ============================================================
- * legacy disabled probe - retained only to avoid old object references.
- *
- * Old experiments used a game-type pad session (previously confirmed that
- * pt_call scePadOpen(userId,0,0) returns a positive handle there).
- * After sceMbusBindDeviceWithUserId assigns the virtual device to userId,
- * the virtual device should appear at slot 1 in the game-type session.
- * Returns the first positive handle found, or -1 if none.
- * ============================================================ */
+/* VDI probe with NEUTRAL state (buttons=0) — confirms VDI works without
+ * sending any input to the UI. Used by GBND handler instead of Cross so
+ * the UI is not disturbed when no assignment screen is visible.
+ * Cross is only pressed by the stub when assignment_hint detects the screen. */
+int
+shellcore_pad_test_vdi_neutral(int32_t pad_handle)
+{
+    pid_t target_pid = -1;
+    {
+        pid_t pids[8]; size_t n;
+        n = find_pids("SceShellCore", pids, 8);
+        if (n > 0) target_pid = pids[0];
+    }
+    if (target_pid < 0) return -1;
+    if (sys_ptrace(PT_ATTACH, target_pid, 0, 0)) return -1;
+    waitpid(target_pid, NULL, 0);
+
+    uint32_t libpad_h = 0;
+    get_lib(target_pid, "libScePad", &libpad_h);
+    intptr_t fn_vdi  = libpad_h ? resolve_sym(target_pid, libpad_h, "scePadVirtualDeviceInsertData") : 0;
+    intptr_t trap_mem = libpad_h ? kernel_dynlib_init_addr(target_pid, libpad_h) : 0;
+    if (!trap_mem && libpad_h) trap_mem = kernel_dynlib_fini_addr(target_pid, libpad_h);
+    if (!fn_vdi || !trap_mem) { sys_ptrace(PT_DETACH, target_pid, (caddr_t)1, 0); return -1; }
+
+    kernel_set_vmem_protection(target_pid, trap_mem, 16, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint8_t int3 = 0xCC;
+    pt_io_write(target_pid, trap_mem, &int3, 1);
+
+    uint8_t neutral[SHELLUI_PAD_DATA_SIZE];
+    memset(neutral, 0, SHELLUI_PAD_DATA_SIZE);
+    neutral[4] = 128; neutral[5] = 128; neutral[6] = 128; neutral[7] = 128;
+    neutral[26] = 0x80; neutral[27] = 0x3F;
+    neutral[76] = 1;
+
+    int64_t r = pt_call_with_copy(target_pid, fn_vdi, trap_mem,
+                                   (uint64_t)pad_handle, neutral, SHELLUI_PAD_DATA_SIZE);
+    klog_printf("[Ghostpad] vdi_neutral: handle=0x%x ret=%lld\n", (uint32_t)pad_handle, (long long)r);
+    sys_ptrace(PT_DETACH, target_pid, (caddr_t)1, 0);
+    return (int)r;
+}
+
+/* shellui_pad_probe_legacy_disabled — legacy probe, disabled; returns -1 immediately */
 /* ============================================================
  * shellui_pad_patch_vda — disassemble + patch scePadVirtualDeviceAddDevice
  * in SceShellCore's libScePad to bypass the 0x803b0006 assignment-screen
@@ -2663,28 +2649,9 @@ shellui_pad_patch_vda(int dump_only)
 
     int patches = 0;
 
-    /* SURGICAL PATCH STRATEGY (2026-05-23):
-     * Aggressive patch at +0xfb also zeroed eax for the EARLY error returns
-     * (0x80920005 NOT_INIT, 0x80920001 INVALID_ARG).  Stub's first VDA call
-     * (uid=0x18c60ea1) returns INVALID_ARG normally; with that path zeroed,
-     * stub short-circuits as "success" and never calls VDA(uid=1) which
-     * actually creates the device.
-     *
-     * Surgical fix: redirect the IPC dispatch call to a code cave that calls
-     * the original dispatcher then forces eax=0 — only the IPC-return path
-     * gets the override, not the early validation errors.
-     *
-     * Layout: code cave in `cc` padding at +0x115..+0x11d (11 bytes available)
-     *   +0x115: e8 ?? ?? ?? ??  ; call original dispatcher (sub at +0xb460)
-     *   +0x11a: 31 c0           ; xor eax, eax
-     *   +0x11c: eb dd           ; jmp short -35 → back to +0xfb canary check
-     *
-     * Then replace the original call at +0xf6 with: `e8 1a 00 00 00`
-     * (call rel32 to cave at +0x115).
-     *
-     * Net effect: IPC call still happens (device gets created), but eax is
-     * zeroed before the canary check & ret.  Early validation paths still
-     * return their original error codes. */
+    /* Surgical patch: redirect IPC dispatch call into a code cave that calls the
+     * original dispatcher then forces eax=0, bypassing only the IPC-return path.
+     * Early validation errors (INVALID_ARG, NOT_INIT) keep their original codes. */
 
     /* Find the IPC call pattern: e8 ?? ?? ?? ?? 48 8B 0B 48 3B 4D F0 75 ??
      * (call followed immediately by canary epilogue). */
@@ -3075,4 +3042,99 @@ shellui_pad_force_bind(uint64_t virtualDeviceId, int32_t userId)
 
     sys_ptrace(PT_DETACH, target_pid, (caddr_t)1, 0);
     return (ret == 0) ? 0 : (int)ret;
+}
+
+/* shellui_pad_relaunch_stub_with_handle — re-launch stub with known VDI handle.
+ * Stub takes fast path (no VDA); subsequent updates use mdbg_copyin (no lag). */
+int
+shellui_pad_relaunch_stub_with_handle(int32_t handle)
+{
+    if (!g_relaunch_stub_fn || !g_relaunch_pthread_fn || g_relaunch_pid < 0) {
+        klog_printf("[Ghostpad] relaunch: no injection state saved — inject first\n");
+        return -1;
+    }
+
+    pid_t    pid       = g_relaunch_pid;
+    intptr_t args_addr = g_relaunch_args_kaddr;
+
+    klog_printf("[Ghostpad] relaunch: pid=%d handle=%d args=0x%lx\n",
+                pid, handle, args_addr);
+
+    /* PT_ATTACH, write args via PT_IO, launch stub thread */
+    if (sys_ptrace(PT_ATTACH, pid, 0, 0) != 0) {
+        klog_printf("[Ghostpad] relaunch: PT_ATTACH failed errno=%d\n", errno);
+        return -1;
+    }
+    waitpid(pid, NULL, 0);
+
+    /* Allocate fresh heap in SceShellCore for shellui_stub via pt_call(malloc) */
+    size_t reg_stub_len = (size_t)((uintptr_t)shellui_stub_end - (uintptr_t)shellui_stub);
+    intptr_t new_stub_block = 0;
+    intptr_t new_trap_rip   = g_relaunch_trap_rip;  /* fallback: original trap */
+    intptr_t new_stub_fn    = g_relaunch_stub_fn;   /* fallback: original cave (unsafe) */
+
+    if (g_relaunch_malloc_fn) {
+        new_stub_block = (intptr_t)pt_call(pid, g_relaunch_malloc_fn, g_relaunch_trap_rip,
+                                            (uint64_t)(reg_stub_len + 32), 0, 0, 0, 0, 0);
+        klog_printf("[Ghostpad] relaunch: malloc(%zu) -> 0x%lx\n", reg_stub_len+32, new_stub_block);
+    }
+
+    if (new_stub_block) {
+        kernel_set_vmem_protection(pid, new_stub_block, reg_stub_len + 32,
+                                   PROT_READ | PROT_WRITE | PROT_EXEC);
+
+        uint8_t int3 = 0xCC;
+        pt_io_write(pid, new_stub_block, &int3, 1);         /* INT3 trap at offset 0 */
+
+        if (!pt_io_write(pid, new_stub_block + 16, shellui_stub, reg_stub_len)) {
+            klog_printf("[Ghostpad] relaunch: shellui_stub (%zu bytes) -> 0x%lx ok\n",
+                        reg_stub_len, new_stub_block + 16);
+            new_trap_rip = new_stub_block;
+            new_stub_fn  = new_stub_block + 16;
+        } else {
+            klog_printf("[Ghostpad] relaunch: shellui_stub write failed errno=%d\n", errno);
+            new_stub_block = 0;
+        }
+    }
+
+    if (!new_stub_block) {
+        klog_printf("[Ghostpad] relaunch: no new block — cannot safely run shellui_stub\n");
+        sys_ptrace(PT_DETACH, pid, (caddr_t)1, 0);
+        return -1;
+    }
+
+    /* Write handle + reset args */
+    int32_t v32;
+    v32 = handle;
+    if (pt_io_write(pid, args_addr + (intptr_t)offsetof(ShellUiPadArgs, pad_handle), &v32, 4)) {
+        klog_printf("[Ghostpad] relaunch: PT_IO write handle failed errno=%d\n", errno);
+        sys_ptrace(PT_DETACH, pid, (caddr_t)1, 0);
+        return -1;
+    }
+    klog_printf("[Ghostpad] relaunch: PT_IO pad_handle=%d ok\n", handle);
+
+    v32 = 0;
+    pt_io_write(pid, args_addr + (intptr_t)offsetof(ShellUiPadArgs, ready), &v32, 4);
+    pt_io_write(pid, args_addr + (intptr_t)offsetof(ShellUiPadArgs, stop),  &v32, 4);
+
+    /* seq=1: use_insert hint, fp_vda=NULL: skip VDA (device already bound) */
+    v32 = 1;
+    pt_io_write(pid, args_addr + (intptr_t)offsetof(ShellUiPadArgs, seq), &v32, 4);
+
+    intptr_t null_fn = 0;
+    pt_io_write(pid, args_addr + (intptr_t)offsetof(ShellUiPadArgs, fp_vda),
+                &null_fn, sizeof(null_fn));
+
+    /* Launch stub thread with correctly-sized allocation */
+    int64_t pret = pt_call(pid, g_relaunch_pthread_fn, new_trap_rip,
+                           (uint64_t)g_relaunch_thread_storage, 0,
+                           (uint64_t)new_stub_fn,
+                           (uint64_t)g_relaunch_args_kaddr, 0, 0);
+    klog_printf("[Ghostpad] relaunch: pthread_create -> %lld\n", (long long)pret);
+
+    /* PT_DETACH so SceShellCore resumes and the stub thread can run */
+    sys_ptrace(PT_DETACH, pid, (caddr_t)1, 0);
+    klog_printf("[Ghostpad] relaunch: SceShellCore detached — stub thread running\n");
+
+    return (pret == 0) ? 0 : -1;
 }

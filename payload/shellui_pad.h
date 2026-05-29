@@ -78,6 +78,10 @@ int shellui_pad_direct_adopt_vdi_handle(pid_t shellui_pid, intptr_t args_kaddr,
                                         int32_t vdi_handle);
 int shellui_pad_direct_recover(pid_t shellui_pid, intptr_t args_kaddr, int32_t userId, int32_t altUserId);
 void shellui_pad_direct_get_last_status(int32_t *stage, int64_t *value);
+/* Re-launch stub thread with pre-set VDI handle — one-time pt_call, then
+ * use shellui_pad_update() (mdbg_copyin) for all packets. No per-packet
+ * ptrace freeze. Requires ptrace authid set permanently in caller. */
+int shellui_pad_relaunch_stub_with_handle(int32_t handle);
 int shellui_pad_direct_begin(pid_t shellui_pid, intptr_t args_kaddr);
 int shellui_pad_direct_send(pid_t shellui_pid, intptr_t args_kaddr,
                             const void *pad_data, uint32_t pad_data_len);
@@ -107,6 +111,7 @@ int shellui_pad_disconnect_device(uint64_t physicalDeviceId);
  * directly, bypassing scePadGetHandle.  padHandle comes from the CIM log. */
 int shellui_pad_test_vdi_cross(int32_t pad_handle);
 int shellcore_pad_test_vdi_cross(int32_t pad_handle);
+int shellcore_pad_test_vdi_neutral(int32_t pad_handle); /* buttons=0, no UI input */
 
 /* PT_ATTACH SceShellCore and call VDA(userId, type=3) via pt_call after
  * assignment.  Returns VDA return value; if >= 0 it is the VDI write handle. */
